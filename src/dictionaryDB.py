@@ -15,16 +15,24 @@ import sqlite3
 import traceback
 import time
 from typing import Callable, Dict, Any, Tuple
+import threading
 
 __all__ = ['writeDB', 'readDB', 'archiveDB']  # Specify the functions to be exported
 
 # Cache for database connections
-db_connection_cache: Dict[str, sqlite3.Connection] = {}
+db_connection_cache: Dict[tuple[str, int], sqlite3.Connection] = {}
+
 # Cache for table schemas
 schema_cache: Dict[str, Dict[str, list]] = {}
 
-
-def readDB(dbFileName: str, dbTable: str, limit: int = 1, orderBy: str = None, whereClause: str = None, fields: list = None, include_id: bool = False) -> list:
+def readDB(dbFileName: str, 
+    dbTable: str,
+    limit: int = 1,
+    orderBy: str = None,
+    whereClause: str = None,
+    fields: list = None,
+    include_id: bool = False
+) -> list:
     """
     Read records from dbTable of dbFileName.
     
@@ -33,6 +41,7 @@ def readDB(dbFileName: str, dbTable: str, limit: int = 1, orderBy: str = None, w
         dbTable: The name of the table to read from.
         limit: The maximum number of records to return (default is 1).
         orderBy: Optional ORDER BY clause (e.g., "id DESC").
+        whereClause: Optional WHERE clause (e.g., "FIELDNAME = 'value'").
         fields: Optional list of fields to return; if None, return all fields.
         include_id: Optional boolean to specify if the 'id' field should be included (default is False).
     
@@ -57,16 +66,18 @@ def readDB(dbFileName: str, dbTable: str, limit: int = 1, orderBy: str = None, w
 
         query = f"SELECT {fields_str} FROM {dbTable}"
         
-        if orderBy:
-            query += f" ORDER BY {orderBy}"
-
         if whereClause:
             query += f" WHERE {whereClause}"
         
         if limit:
-            query += f" LIMIT {limit}"
+            if limit > 0:
+                query += f" LIMIT {limit}"
+
+        if orderBy:
+            query += f" ORDER BY {orderBy}"
 
         # Execute the query
+        #print(f"sqlite3 query:{query}")
         cursor.execute(query)
         
         # Fetch the results
@@ -89,12 +100,22 @@ def readDB(dbFileName: str, dbTable: str, limit: int = 1, orderBy: str = None, w
         cursor.close()
 
 
-def writeDB(dbFileName: str, dbTable: str, data: Any, timestamp_field: str = None, cumulative_fields: list = None) -> None:
+def writeDB(dbFileName: str,
+    dbTable: str,
+    data: Any,
+    timestamp_field: str = None,
+    cumulative_fields: list = None
+) -> None:
     """
     Write data as a new record in dbTable of dbFileName.
-        cumulative_fields means those values accumulate regardless of resets.
+
+    Parameters:
+        dbFileName: The name of the database file.
+        dbTable: The name of the table to read from.
+        data: list of dictionaries representing the records.
         timestamp_field: Optional field name for storing the timestamp.
-        cumulative_fields: List of fields to accumulate; defaults to None.
+        cumulative_fields: List of fields to accumulate regardless of resets; defaults to None.
+
     """
     # Add the current Unix timestamp to the data dictionary
     if timestamp_field is not None:
@@ -272,11 +293,12 @@ def archiveDB(
 
             # Initialize the database and create the table if it doesn't exist
             initialize_database(archiveFileName, dbTable, schema)  # Ensure archive table is also initialized
-
             for record in old_records:
-                placeholders = ', '.join(['?'] * len(column_names[1:]))  # Exclude 'id' column
-                cursor_archive.execute(f'INSERT INTO {dbTable} ({", ".join(column_names[1:])}) VALUES ({placeholders})', record[1:])
-                cursor_main.execute(f'DELETE FROM {dbTable} WHERE id = ?', (record[0],))
+                # Prepare the values for the INSERT statement, excluding the 'id'
+                values_to_insert = [record[column_name] for column_name in column_names[1:]]
+                placeholders = ', '.join(['?'] * len(values_to_insert))  # Create placeholders for the values
+                cursor_archive.execute(f'INSERT INTO {dbTable} ({", ".join(column_names[1:])}) VALUES ({placeholders})', values_to_insert)
+                cursor_main.execute(f'DELETE FROM {dbTable} WHERE id = ?', (record['id'],))  # Use 'id' key to delete
 
             # Commit the changes to both databases
             conn_main.commit()
@@ -289,6 +311,7 @@ def archiveDB(
         conn_main.rollback()
         conn_archive.rollback()
         print(f"Error processing old records: {e}")
+        traceback.print_exc()
 
     finally:
         # Close the cursors
@@ -311,12 +334,14 @@ def initialize_database(dbFileName: str, dbTable: str, data: Dict[str, Any]) -> 
     update_schema(dbFileName, dbTable, data)
 
 def get_conn(dbFileName: str) -> sqlite3.Connection:
-    """Get cached connection from databese filename, opens db if needed."""
-    conn = db_connection_cache.get(dbFileName)
+    """Get cached connection from database filename and thread ID, opens db if needed."""
+    thread_id = threading.get_ident()
+    cache_key = (dbFileName, thread_id)
+    conn = db_connection_cache.get(cache_key)
     if conn is None:
         conn = sqlite3.connect(dbFileName)
         conn.row_factory = sqlite3.Row
-        db_connection_cache[dbFileName] = conn
+        db_connection_cache[cache_key] = conn
     return conn
 
 def get_table_schema(dbFileName: str, dbTable: str) -> list:
@@ -371,5 +396,4 @@ def update_schema(dbFileName: str, dbTable: str, data: Dict[str, Any]) -> None:
                 schema_cache.pop(cache_key)
     cursor.close()
     # TODO: Account for user data type overrides
-
 
